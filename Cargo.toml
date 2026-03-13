@@ -1,0 +1,25 @@
+[package]
+name = "nostr-indexer-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Web API
+axum = "0.7.5"
+tokio = { version = "1.37.0", features = ["full"] }
+
+# Nostr SDK
+nostr-sdk = { version = "0.33.0" }
+
+# Database (SQLite)
+sqlx = { version = "0.7.4", features = ["runtime-tokio", "sqlite", "chrono"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Env vars and logging
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
