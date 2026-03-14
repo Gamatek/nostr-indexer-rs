@@ -20,17 +20,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Démarrage de l'indexeur Nostr pour Torrents (NIP-35)...");
 
-    // 2. Connexion et initialisation de la base de données SQLite
-    let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://nostr_indexer.db".to_string());
+    // 2. Connexion et initialisation de la base de données MySQL
+    let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "mysql://user:password@localhost/nostr_indexer".to_string());
     
     let pool = db::init_db(&db_url).await.map_err(|e| {
-        error!("Erreur lors de l'initialisation de la base de données SQLite: {}", e);
+        error!("Erreur lors de l'initialisation de la base de données MySQL: {}", e);
         e
     })?;
 
-    info!("Base de données SQLite connectée avec succès au mode WAL !");
+    info!("Base de données MySQL connectée avec succès!");
 
-    // Clone le pool SQLite pour qu'on puisse l'utiliser à la fois dans l'indexeur asynchrone et dans l'API
+    // Clone le pool MySQL pour qu'on puisse l'utiliser à la fois dans l'indexeur asynchrone et dans l'API
     let indexer_pool = pool.clone();
     
     // 3. Phase 2 - Configurer le client Nostr pour l'ingestion NIP-35

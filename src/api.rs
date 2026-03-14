@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, MySql};
 use crate::models::Torrent;
 
 // Structure pour recevoir les paramètres d'URL : ?q=ubuntu
@@ -15,7 +15,7 @@ pub struct SearchQuery {
 }
 
 // Fonction qui construit notre routeur (toutes les URLs de notre API)
-pub fn create_router(pool: Pool<Sqlite>) -> Router {
+pub fn create_router(pool: Pool<MySql>) -> Router {
     Router::new()
         .route("/api/torrents", get(search_torrents))
         .with_state(pool)
@@ -23,7 +23,7 @@ pub fn create_router(pool: Pool<Sqlite>) -> Router {
 
 // Handler qui répond aux requêtes GET /api/torrents
 async fn search_torrents(
-    State(pool): State<Pool<Sqlite>>,
+    State(pool): State<Pool<MySql>>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<Torrent>>, (StatusCode, String)> {
     
@@ -35,17 +35,14 @@ async fn search_torrents(
                 id, 
                 infohash, 
                 title, 
-                magnet, 
                 size_bytes, 
                 pubkey, 
                 created_at,
-                tags,
                 source,
                 source_id,
-                content,
-                files
+                content
             FROM torrents
-            WHERE title LIKE ?1
+            WHERE title LIKE ?
             ORDER BY created_at DESC
             LIMIT 50
             "#
@@ -61,15 +58,12 @@ async fn search_torrents(
                 id, 
                 infohash, 
                 title, 
-                magnet, 
                 size_bytes, 
                 pubkey, 
                 created_at,
-                tags,
                 source,
                 source_id,
-                content,
-                files
+                content
             FROM torrents
             ORDER BY created_at DESC
             LIMIT 50
@@ -80,7 +74,29 @@ async fn search_torrents(
     };
 
     match result {
-        Ok(torrents) => Ok(Json(torrents)),
+        Ok(mut torrents) => {
+            // On construit le champ `magnet` programmatiquement pour chaque torrent
+            for torrent in &mut torrents {
+                torrent.magnet = Some(format!("magnet:?xt=urn:btih:{}", torrent.infohash));
+                
+                // Récupération des tags pour ce torrent
+                let tags: Vec<(String,)> = sqlx::query_as("SELECT tag FROM torrent_tags WHERE torrent_id = ?")
+                    .bind(&torrent.id)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_default();
+                torrent.tags = tags.into_iter().map(|t| t.0).collect();
+
+                // Récupération des fichiers pour ce torrent
+                let files: Vec<crate::models::TorrentFile> = sqlx::query_as("SELECT file_path, size_bytes FROM torrent_files WHERE torrent_id = ?")
+                    .bind(&torrent.id)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_default();
+                torrent.files = files;
+            }
+            Ok(Json(torrents))
+        },
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Erreur de base de données : {}", e),

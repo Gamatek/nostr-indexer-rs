@@ -1,9 +1,9 @@
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, MySql};
 use std::time::Duration;
 use tracing::{info, error};
 
-pub async fn start_indexer(db_pool: Pool<Sqlite>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start_indexer(db_pool: Pool<MySql>) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialisation du Client Nostr
     let my_keys = Keys::generate();
     let client = Client::new(&my_keys);
@@ -51,7 +51,7 @@ pub async fn start_indexer(db_pool: Pool<Sqlite>) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-async fn sync_historical_torrents(client: &Client, db_pool: &Pool<Sqlite>) {
+async fn sync_historical_torrents(client: &Client, db_pool: &Pool<MySql>) {
     // Obtenir la plage de dates qu'on a déjà en base de données
     let row: (Option<i64>, Option<i64>) = sqlx::query_as(
         "SELECT MIN(created_at), MAX(created_at) FROM torrents"
@@ -95,8 +95,8 @@ async fn sync_historical_torrents(client: &Client, db_pool: &Pool<Sqlite>) {
             Filter::new().kind(Kind::from(2003)).until(until).limit(2000),
         ];
 
-        // On demande l'historique aux relais, avec un timeout de 15 secondes
-        match client.get_events_of(filters, Some(Duration::from_secs(15))).await {
+        // On demande l'historique aux relais, avec un timeout de 30 secondes
+        match client.get_events_of(filters, Some(Duration::from_secs(30))).await {
             Ok(events) => {
                 if events.is_empty() {
                     info!("Synchro historique totalement terminée ! Tout le catalogue est aspiré.");
@@ -138,7 +138,7 @@ async fn sync_historical_torrents(client: &Client, db_pool: &Pool<Sqlite>) {
     }
 }
 
-async fn process_event(event: &Event, pool: &Pool<Sqlite>) -> Result<bool, sqlx::Error> {
+async fn process_event(event: &Event, pool: &Pool<MySql>) -> Result<bool, sqlx::Error> {
     // Le pubkey (Auteur de l'événement) - Pour l'instant on indexe tout, on ajoutera le WoT plus tard
     let pubkey = event.author().to_hex();
     let created_at = event.created_at().as_u64() as i64;
@@ -147,7 +147,6 @@ async fn process_event(event: &Event, pool: &Pool<Sqlite>) -> Result<bool, sqlx:
     // On parcourt les tags pour trouver ce qui nous intéresse
     let mut infohash = None;
     let mut title = None;
-    let mut magnet = None;
     let mut size_bytes = None;
     let mut tags_list: Vec<String> = Vec::new();
     let mut files_list: Vec<String> = Vec::new(); // Pour retenir "chemin;taille"
@@ -164,14 +163,6 @@ async fn process_event(event: &Event, pool: &Pool<Sqlite>) -> Result<bool, sqlx:
             match tag_type.as_str() {
                 "x" => infohash = val, // Infohash Bittorrent
                 "title" | "name" => title = val,
-                "magnet" | "url" => {
-                    // On garde l'URL seulement si c'est un magnet
-                    if let Some(url) = val {
-                        if url.starts_with("magnet:") {
-                            magnet = Some(url);
-                        }
-                    }
-                }
                 "size" => {
                     if let Some(s) = val {
                         size_bytes = s.parse::<i64>().ok();
@@ -209,56 +200,62 @@ async fn process_event(event: &Event, pool: &Pool<Sqlite>) -> Result<bool, sqlx:
         }
     }
 
-    // Conversion des tags accumulés en une string JSON pour pouvoir chercher plus tard
-    let tags_json = if tags_list.is_empty() {
-        None
-    } else {
-        serde_json::to_string(&tags_list).ok()
-    };
-    
-    // Conversion de la liste de fichiers (ex: "Cover.jpg;2770334") en JSON
-    let files_json = if files_list.is_empty() {
-        None
-    } else {
-        serde_json::to_string(&files_list).ok()
-    };
-
     // Le torrent n'a pas de Hash (exigence minimale pour notre Indexeur), on l'ignore
     let hash = match infohash {
         Some(h) => h,
         None => return Ok(false),
     };
 
-    // Insertion en base (Utilisation de query pour ne pas bloquer le build si la base est en cours de migration)
+    // 1. Insertion du torrent principal
     sqlx::query(
         r#"
-        INSERT INTO torrents (id, infohash, title, magnet, size_bytes, pubkey, created_at, tags, source, source_id, content, files)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-        ON CONFLICT(id) DO UPDATE SET
-            title = excluded.title,
-            magnet = excluded.magnet,
-            size_bytes = excluded.size_bytes,
-            tags = excluded.tags,
-            source = excluded.source,
-            source_id = excluded.source_id,
-            content = excluded.content,
-            files = excluded.files
+        INSERT INTO torrents (id, infohash, title, size_bytes, pubkey, created_at, source, source_id, content)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE 
+            title = VALUES(title),
+            size_bytes = VALUES(size_bytes),
+            source = VALUES(source),
+            source_id = VALUES(source_id),
+            content = VALUES(content)
         "#
     )
-    .bind(event_id)
+    .bind(&event_id)
     .bind(hash)
     .bind(title)
-    .bind(magnet)
     .bind(size_bytes)
     .bind(pubkey)
     .bind(created_at)
-    .bind(tags_json)
     .bind(source)
     .bind(source_id)
     .bind(content)
-    .bind(files_json)
     .execute(pool)
     .await?;
+
+    // 2. Insertion des tags (categories)
+    for tag in tags_list {
+        // Optionnel: tronquer à 128 chars pour éviter des inserts trop longs
+        let truncated_tag: String = tag.chars().take(128).collect();
+        sqlx::query("INSERT IGNORE INTO torrent_tags (torrent_id, tag) VALUES (?, ?)")
+            .bind(&event_id)
+            .bind(truncated_tag)
+            .execute(pool)
+            .await?;
+    }
+
+    // 3. Insertion des fichiers individuels
+    for file in files_list {
+        // Certains indexeurs formatent le fichier de la façon suivante : "Nom du fichier.mp4;52304895"
+        let parts: Vec<&str> = file.split(';').collect();
+        let file_path = parts.first().unwrap_or(&file.as_str()).to_string();
+        let file_size: Option<i64> = parts.get(1).and_then(|s| s.parse().ok());
+        
+        sqlx::query("INSERT INTO torrent_files (torrent_id, file_path, size_bytes) VALUES (?, ?, ?)")
+            .bind(&event_id)
+            .bind(file_path)
+            .bind(file_size)
+            .execute(pool)
+            .await?;
+    }
 
     Ok(true)
 }
